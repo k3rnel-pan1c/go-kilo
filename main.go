@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -57,13 +56,9 @@ func enableRawMode() {
 	if err != nil {
 		die(err)
 	}
-	termios, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TCGETS)
-	if err != nil {
+	if err := setRawModeReadTimeout(int(os.Stdin.Fd())); err != nil {
 		die(err)
 	}
-	termios.Cc[unix.VMIN] = 0
-	termios.Cc[unix.VTIME] = 1
-	unix.IoctlSetTermios(int(os.Stdin.Fd()), unix.TCSETS, termios)
 
 }
 
