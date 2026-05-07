@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -10,7 +12,8 @@ import (
 
 /* defines/macros/functions */
 
-var version = "0.0.1"
+var kilo_version = "0.0.1"
+var kilo_tab_stop = 8
 
 func ctrlKey(k int) int {
 	return k & 0x1f
@@ -30,11 +33,22 @@ const (
 
 /* data */
 
+type erow struct {
+	rsize  int    //number of chars in render
+	chars  []byte //raw line content
+	render []byte //line content with tabs expanded to spaces
+}
+
 type editorConfig struct {
-	cx, cy     int
-	screenrows int
-	screencols int
-	termios    *term.State
+	cx, cy     int         //cursor x and y pos relative to the rows and cols
+	rx         int         //index to the render field (cx + amount of tabs * tab spaces)
+	rowoff     int         //row the user scrolled to (vertical scroll offset)
+	coloff     int         //col the user scrolled to (horizontal scroll offset)
+	screenrows int         //number of rows the terminal can display
+	screencols int         //number of cols the terminal can display
+	numrows    int         //number of rows in the file
+	row        []erow      //file rows
+	termios    *term.State //original terminal state, restored on exit
 }
 
 var E editorConfig
@@ -162,24 +176,126 @@ func getWindowSize() (int, int) {
 	return rows, cols
 }
 
+/* row operations */
+
+func editorRowCxToRx(row *erow, cx int) int {
+	rx := 0
+	for y := range cx {
+		if row.chars[y] == '\t' {
+			rx += (kilo_tab_stop - 1) - (rx % kilo_tab_stop)
+		}
+		rx++
+	}
+	return rx
+}
+
+func editorUpdateRow(row *erow) {
+	idx := 0
+	for _, c := range row.chars {
+		if c == '\t' {
+			row.render = append(row.render, ' ')
+			idx++
+			for idx%kilo_tab_stop != 0 {
+				row.render = append(row.render, ' ')
+				idx++
+			}
+		} else {
+			row.render = append(row.render, c)
+			idx++
+		}
+	}
+
+	row.rsize = len(row.render)
+}
+
+func editorAppendRow(s []byte) {
+	at := E.numrows
+
+	E.row = append(E.row, erow{chars: s})
+
+	// not needed in go but added for understanding
+	E.row[at].rsize = 0
+	E.row[at].render = nil
+
+	editorUpdateRow(&E.row[at])
+
+	E.numrows++
+}
+
+/* file i/o */
+
+func editorOpen(filename string) {
+	f, err := os.Open(filename)
+	if err != nil {
+		die(err)
+	}
+
+	scanner := bufio.NewScanner(f)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		line = bytes.TrimRight(line, "\n")
+		line = bytes.TrimRight(line, "\r")
+		line = bytes.TrimRight(line, "\r\n")
+
+		editorAppendRow(line)
+	}
+	f.Close()
+
+}
+
 /* output */
+
+func editorScroll() {
+	E.rx = E.cx
+
+	//vertical
+	if E.cy < E.rowoff {
+		E.rowoff = E.cy
+	}
+	if E.cy >= E.rowoff+E.screenrows {
+		E.rowoff = E.cy - E.screenrows + 1
+	}
+
+	// horizontal
+	if E.rx < E.coloff {
+		E.coloff = E.rx
+	}
+	if E.rx >= E.coloff+E.screencols {
+		E.coloff = E.rx - E.screencols + 1
+	}
+
+}
 
 func editorDrawRows(ab []byte) []byte {
 	for y := range E.screenrows {
-		if y == E.screenrows/3 {
-			welcome := fmt.Sprintf("Kilo editor -- version %s", version)
-			if len(welcome) > E.screencols {
-				welcome = welcome[:E.screencols]
+		filerow := y + E.rowoff
+		if filerow >= E.numrows {
+			//open without file
+			if E.numrows == 0 && y == E.screenrows/3 {
+				welcome := fmt.Sprintf("Kilo editor -- version %s", kilo_version)
+				if len(welcome) > E.screencols {
+					welcome = welcome[:E.screencols]
+				}
+				padding := (E.screencols - len(welcome)) / 2
+				ab = append(ab, '~')
+				padding--
+				for range padding {
+					ab = append(ab, ' ')
+				}
+				ab = append(ab, []byte(welcome)...)
+			} else {
+				ab = append(ab, '~')
 			}
-			padding := (E.screencols - len(welcome)) / 2
-			ab = append(ab, '~')
-			padding--
-			for range padding {
-				ab = append(ab, ' ')
-			}
-			ab = append(ab, []byte(welcome)...)
 		} else {
-			ab = append(ab, '~')
+			len := E.row[filerow].rsize - E.coloff
+			if len < 0 {
+				len = 0
+			}
+			if len > E.screencols {
+				len = E.screencols
+			}
+			ab = append(ab, E.row[filerow].render[E.coloff:E.coloff+len]...)
 		}
 
 		// clear line
@@ -193,16 +309,20 @@ func editorDrawRows(ab []byte) []byte {
 }
 
 func editorRefreshScreen() {
+	editorScroll()
+
 	ab := make([]byte, 0)
 	// hide cursor
 	ab = append(ab, []byte("\x1b[?25l")...)
+	// disable text wrapping
+	ab = append(ab, []byte("\x1b[?7l")...)
 	// move cursor to top left
 	ab = append(ab, []byte("\x1b[H")...)
 
 	ab = editorDrawRows(ab)
 
 	// move cursor to coordinates
-	buf := fmt.Sprintf("\x1b[%d;%dH", E.cy+1, E.cx+1)
+	buf := fmt.Sprintf("\x1b[%d;%dH", (E.cy-E.rowoff)+1, (E.rx-E.coloff)+1)
 	ab = append(ab, []byte(buf)...)
 
 	// show cursor
@@ -214,23 +334,36 @@ func editorRefreshScreen() {
 /* input */
 
 func editorMoveCursor(key int) {
+
 	switch key {
 	case ARROW_LEFT:
 		if E.cx != 0 {
 			E.cx--
+		} else if E.cy > 0 {
+			E.cy--
+			E.cx = len(E.row[E.cy].chars)
 		}
 	case ARROW_RIGHT:
-		if E.cx != E.screencols-1 {
+		if E.cy < E.numrows && E.cx < len(E.row[E.cy].chars) {
 			E.cx++
+		} else if E.cy < E.numrows && E.cx == len(E.row[E.cy].chars) {
+			E.cy++
+			E.cx = 0
 		}
+
 	case ARROW_UP:
 		if E.cy != 0 {
 			E.cy--
 		}
 	case ARROW_DOWN:
-		if E.cy != E.screenrows-1 {
+		if E.cy < E.numrows {
 			E.cy++
 		}
+	}
+
+	rowlen := len(E.row[E.cy].chars)
+	if E.cx > rowlen {
+		E.cx = rowlen
 	}
 }
 
@@ -273,13 +406,23 @@ func editorProcessKeypress() bool {
 func initEditor() {
 	E.cx = 0
 	E.cy = 0
+	E.rx = 0
+	E.rowoff = 0
+	E.coloff = 0
+	E.numrows = 0
+	E.row = nil
+
 	E.screenrows, E.screencols = getWindowSize()
+
 }
 
 func main() {
 	enableRawMode()
 	defer disableRawMode()
 	initEditor()
+	if len(os.Args) >= 2 {
+		editorOpen(os.Args[1])
+	}
 
 	for {
 		editorRefreshScreen()
