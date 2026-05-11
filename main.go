@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -40,15 +41,18 @@ type erow struct {
 }
 
 type editorConfig struct {
-	cx, cy     int         //cursor x and y pos relative to the rows and cols
-	rx         int         //index to the render field (cx + amount of tabs * tab spaces)
-	rowoff     int         //row the user scrolled to (vertical scroll offset)
-	coloff     int         //col the user scrolled to (horizontal scroll offset)
-	screenrows int         //number of rows the terminal can display
-	screencols int         //number of cols the terminal can display
-	numrows    int         //number of rows in the file
-	row        []erow      //file rows
-	termios    *term.State //original terminal state, restored on exit
+	cx, cy         int         //cursor x and y pos relative to the rows and cols
+	rx             int         //index to the render field (cx + amount of tabs * tab spaces)
+	rowoff         int         //row the user scrolled to (vertical scroll offset)
+	coloff         int         //col the user scrolled to (horizontal scroll offset)
+	screenrows     int         //number of rows the terminal can display
+	screencols     int         //number of cols the terminal can display
+	numrows        int         //number of rows in the file
+	row            []erow      //file rows
+	filename       string      //name of the opened file
+	statusmsg      string      //statusmessage for search and other input from the user
+	statusmsg_time time.Time   //timestamp of the message
+	termios        *term.State //original terminal state, restored on exit
 }
 
 var E editorConfig
@@ -225,6 +229,7 @@ func editorAppendRow(s []byte) {
 /* file i/o */
 
 func editorOpen(filename string) {
+	E.filename = filename
 	f, err := os.Open(filename)
 	if err != nil {
 		die(err)
@@ -247,7 +252,11 @@ func editorOpen(filename string) {
 /* output */
 
 func editorScroll() {
-	E.rx = E.cx
+	E.rx = 0
+
+	if E.cy < E.numrows {
+		E.rx = editorRowCxToRx(&E.row[E.cy], E.cx)
+	}
 
 	//vertical
 	if E.cy < E.rowoff {
@@ -300,11 +309,52 @@ func editorDrawRows(ab []byte) []byte {
 
 		// clear line
 		ab = append(ab, []byte("\x1b[K")...)
-		if y < E.screenrows-1 {
-			ab = append(ab, []byte("\r\n")...)
-		}
+
+		ab = append(ab, []byte("\r\n")...)
 	}
 
+	return ab
+}
+
+func editorDrawStatusBar(ab []byte) []byte {
+	// reverse video swaps foreground and background colors
+	ab = append(ab, []byte("\x1b[7m")...)
+
+	filename := E.filename
+	if filename == "" {
+		filename = "[No Name]"
+	}
+
+	status := fmt.Sprintf("%.20s - %d lines", filename, E.numrows)
+	status = status[:min(len(status), E.screencols)]
+	slen := len(status)
+
+	rstatus := fmt.Sprintf("%d/%d", E.cy+1, E.numrows)
+	rlen := len(rstatus)
+
+	ab = append(ab, []byte(status)...)
+
+	for range E.screencols {
+		if slen == E.screencols-rlen {
+			ab = append(ab, []byte(rstatus)...)
+			break
+		} else {
+			ab = append(ab, " "...)
+			slen++
+		}
+	}
+	// return the video mode to normal
+	ab = append(ab, []byte("\x1b[m")...)
+	ab = append(ab, []byte("\r\n")...)
+	return ab
+}
+
+func editorDrawMessageBar(ab []byte) []byte {
+	ab = append(ab, []byte("\x1b[K")...)
+	msg := E.statusmsg[:min(len(E.statusmsg), E.screencols)]
+	if time.Since(E.statusmsg_time) < 5*time.Second && len(msg) > 0 {
+		ab = append(ab, []byte(msg)...)
+	}
 	return ab
 }
 
@@ -320,6 +370,8 @@ func editorRefreshScreen() {
 	ab = append(ab, []byte("\x1b[H")...)
 
 	ab = editorDrawRows(ab)
+	ab = editorDrawStatusBar(ab)
+	ab = editorDrawMessageBar(ab)
 
 	// move cursor to coordinates
 	buf := fmt.Sprintf("\x1b[%d;%dH", (E.cy-E.rowoff)+1, (E.rx-E.coloff)+1)
@@ -329,6 +381,12 @@ func editorRefreshScreen() {
 	ab = append(ab, []byte("\x1b[?25h")...)
 
 	os.Stdout.Write(ab)
+}
+
+func editorSetStatusMessage(format string, args ...any) {
+	E.statusmsg = fmt.Sprintf(format, args...)
+	E.statusmsg_time = time.Now()
+
 }
 
 /* input */
@@ -361,10 +419,13 @@ func editorMoveCursor(key int) {
 		}
 	}
 
-	rowlen := len(E.row[E.cy].chars)
-	if E.cx > rowlen {
-		E.cx = rowlen
+	if E.cy < E.numrows {
+		rowlen := len(E.row[E.cy].chars)
+		if E.cx > rowlen {
+			E.cx = rowlen
+		}
 	}
+
 }
 
 func editorProcessKeypress() bool {
@@ -380,12 +441,19 @@ func editorProcessKeypress() bool {
 	case HOME_KEY:
 		E.cx = 0
 	case END_KEY:
-		E.cx = E.screencols - 1
+		if E.cy < E.numrows {
+			E.cx = len(E.row[E.cy].chars)
+		}
 	case PAGE_UP:
+		E.cy = E.rowoff
 		for range E.screenrows {
 			editorMoveCursor(ARROW_UP)
 		}
 	case PAGE_DOWN:
+		E.cy = E.rowoff + E.screenrows - 1
+		if E.cy > E.numrows {
+			E.cy = E.numrows
+		}
 		for range E.screenrows {
 			editorMoveCursor(ARROW_DOWN)
 		}
@@ -411,9 +479,11 @@ func initEditor() {
 	E.coloff = 0
 	E.numrows = 0
 	E.row = nil
+	E.filename = ""
+	E.statusmsg = ""
 
 	E.screenrows, E.screencols = getWindowSize()
-
+	E.screenrows -= 2
 }
 
 func main() {
@@ -423,6 +493,8 @@ func main() {
 	if len(os.Args) >= 2 {
 		editorOpen(os.Args[1])
 	}
+
+	editorSetStatusMessage("HELP: CTRL-Q = quit")
 
 	for {
 		editorRefreshScreen()
