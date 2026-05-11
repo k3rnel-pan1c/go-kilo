@@ -15,12 +15,14 @@ import (
 
 var kilo_version = "0.0.1"
 var kilo_tab_stop = 8
+var kilo_quit_times = 3
 
 func ctrlKey(k int) int {
 	return k & 0x1f
 }
 
 const (
+	BACKSPACE  = 127
 	ARROW_LEFT = 1000 + iota
 	ARROW_RIGHT
 	ARROW_UP
@@ -49,10 +51,13 @@ type editorConfig struct {
 	screencols     int         //number of cols the terminal can display
 	numrows        int         //number of rows in the file
 	row            []erow      //file rows
+	dirty          int         //keeps track of amount of changes made
 	filename       string      //name of the opened file
 	statusmsg      string      //statusmessage for search and other input from the user
 	statusmsg_time time.Time   //timestamp of the message
 	termios        *term.State //original terminal state, restored on exit
+
+	quit_times int // keeping track of ctrl-q presses
 }
 
 var E editorConfig
@@ -195,6 +200,7 @@ func editorRowCxToRx(row *erow, cx int) int {
 
 func editorUpdateRow(row *erow) {
 	idx := 0
+	row.render = nil
 	for _, c := range row.chars {
 		if c == '\t' {
 			row.render = append(row.render, ' ')
@@ -212,10 +218,12 @@ func editorUpdateRow(row *erow) {
 	row.rsize = len(row.render)
 }
 
-func editorAppendRow(s []byte) {
-	at := E.numrows
+func editorInsertRow(at int, s []byte) {
+	if at < 0 || at > E.numrows {
+		return
+	}
 
-	E.row = append(E.row, erow{chars: s})
+	E.row = append(E.row[:at], append([]erow{{chars: s}}, E.row[at:]...)...)
 
 	// not needed in go but added for understanding
 	E.row[at].rsize = 0
@@ -224,9 +232,96 @@ func editorAppendRow(s []byte) {
 	editorUpdateRow(&E.row[at])
 
 	E.numrows++
+	E.dirty++
+}
+
+func editorDelRow(at int) {
+	if at < 0 || at >= E.numrows {
+		return
+	}
+	E.row = append(E.row[:at], E.row[at+1:]...)
+	E.numrows--
+	E.dirty++
+}
+
+func editorRowInsertChar(row *erow, at int, c int) {
+	if at < 0 || at > len(row.chars) {
+		at = len(row.chars)
+	}
+	row.chars = append(row.chars[:at], append([]byte{byte(c)}, row.chars[at:]...)...)
+	editorUpdateRow(row)
+	E.dirty++
+}
+
+func editorRowAppendString(row *erow, s []byte) {
+	row.chars = append(row.chars, s...)
+	editorUpdateRow(row)
+	E.dirty++
+}
+
+func editorRowDelChar(row *erow, at int) {
+	if at < 0 || at >= len(row.chars) {
+		return
+	}
+	row.chars = append(row.chars[:at], row.chars[at+1:]...)
+	editorUpdateRow(row)
+	E.dirty++
+}
+
+/* editor operations */
+
+func editorInsertChar(c int) {
+	if E.cy == E.numrows {
+		editorInsertRow(E.numrows, []byte(""))
+	}
+	editorRowInsertChar(&E.row[E.cy], E.cx, c)
+	E.cx++
+}
+
+func editorInsertNewline() {
+	if E.cx == 0 {
+		editorInsertRow(E.cy, []byte(""))
+	} else {
+		editorInsertRow(E.cy+1, E.row[E.cy].chars[E.cx:])
+		E.row[E.cy].chars = E.row[E.cy].chars[:E.cx]
+		editorUpdateRow(&E.row[E.cy])
+	}
+	E.cy++
+	E.cx = 0
+}
+
+func editorDelChar() {
+	if E.cy == E.numrows {
+		return
+	}
+	if E.cx == 0 && E.cy == 0 {
+		return
+	}
+
+	row := &E.row[E.cy]
+	if E.cx > 0 {
+		editorRowDelChar(row, E.cx-1)
+		E.cx--
+	} else {
+		E.cx = len(E.row[E.cy-1].chars)
+		editorRowAppendString(&E.row[E.cy-1], row.chars)
+		editorDelRow(E.cy)
+		E.cy--
+	}
 }
 
 /* file i/o */
+
+func editorRowsToString() []byte {
+	buf := make([]byte, 0)
+
+	for y := range E.numrows {
+		buf = append(buf, E.row[y].chars...)
+		buf = append(buf, '\n')
+
+	}
+	return buf
+}
 
 func editorOpen(filename string) {
 	E.filename = filename
@@ -243,10 +338,33 @@ func editorOpen(filename string) {
 		line = bytes.TrimRight(line, "\r")
 		line = bytes.TrimRight(line, "\r\n")
 
-		editorAppendRow(line)
+		editorInsertRow(E.numrows, []byte(line))
 	}
 	f.Close()
+	E.dirty = 0
+}
 
+func editorSave() {
+	if E.filename == "" {
+		E.filename = string(editorPrompt("Save as : %s (ESC to cnacel)"))
+		if E.filename == "" {
+			editorSetStatusMessage("Save aborted")
+			return
+		}
+	}
+
+	if E.filename == "" {
+		return
+	}
+
+	buf := editorRowsToString()
+
+	err := os.WriteFile(E.filename, buf, 0644)
+	if err != nil {
+		editorSetStatusMessage("Can't save! I/O error: %s", err.Error())
+	}
+	editorSetStatusMessage("%d bytes written to disk", len(buf))
+	E.dirty = 0
 }
 
 /* output */
@@ -325,7 +443,12 @@ func editorDrawStatusBar(ab []byte) []byte {
 		filename = "[No Name]"
 	}
 
-	status := fmt.Sprintf("%.20s - %d lines", filename, E.numrows)
+	sdirty := ""
+	if E.dirty > 0 {
+		sdirty = "(modified)"
+	}
+
+	status := fmt.Sprintf("%.20s - %d lines %s", filename, E.numrows, sdirty)
 	status = status[:min(len(status), E.screencols)]
 	slen := len(status)
 
@@ -391,6 +514,34 @@ func editorSetStatusMessage(format string, args ...any) {
 
 /* input */
 
+func editorPrompt(prompt string) []byte {
+
+	buf := make([]byte, 0)
+	for {
+		editorSetStatusMessage(prompt, buf)
+		editorRefreshScreen()
+
+		c := editorReadKey()
+		if c == DEL_KEY || c == ctrlKey('h') || c == BACKSPACE {
+			if len(buf) != 0 {
+				buf = buf[:len(buf)-1]
+			}
+
+		} else if c == '\x1b' {
+			editorSetStatusMessage("")
+			return nil
+		} else if c == '\r' {
+			if len(buf) != 0 {
+				editorSetStatusMessage("")
+				return buf
+			}
+		} else if c >= 32 && c < 127 {
+			buf = append(buf, byte(c))
+		}
+
+	}
+}
+
 func editorMoveCursor(key int) {
 
 	switch key {
@@ -432,18 +583,38 @@ func editorProcessKeypress() bool {
 	c := editorReadKey()
 
 	switch c {
+	case '\r':
+		editorInsertNewline()
+
 	case ctrlKey('q'):
+		if E.dirty > 0 && E.quit_times > 0 {
+			editorSetStatusMessage("WARNING!!! File has unsaved changes. Press Ctrl-q %d more times to quit", E.quit_times)
+			E.quit_times--
+			return true
+		}
+
 		// clear screen
 		os.Stdout.Write([]byte("\x1b[2J"))
 		// move cursor to top left
 		os.Stdout.Write([]byte("\x1b[H"))
 		return false
+
+	case ctrlKey('s'):
+		editorSave()
+
 	case HOME_KEY:
 		E.cx = 0
 	case END_KEY:
 		if E.cy < E.numrows {
 			E.cx = len(E.row[E.cy].chars)
 		}
+
+	case BACKSPACE, ctrlKey('h'):
+		editorDelChar()
+	case DEL_KEY:
+		editorMoveCursor(ARROW_RIGHT)
+		editorDelChar()
+
 	case PAGE_UP:
 		E.cy = E.rowoff
 		for range E.screenrows {
@@ -457,15 +628,18 @@ func editorProcessKeypress() bool {
 		for range E.screenrows {
 			editorMoveCursor(ARROW_DOWN)
 		}
-	case ARROW_UP:
+	case ARROW_UP, ARROW_LEFT, ARROW_DOWN, ARROW_RIGHT:
 		editorMoveCursor(c)
-	case ARROW_LEFT:
-		editorMoveCursor(c)
-	case ARROW_DOWN:
-		editorMoveCursor(c)
-	case ARROW_RIGHT:
-		editorMoveCursor(c)
+
+	case ctrlKey('l'):
+	/* TODO */
+	case '\x1b':
+		/* TODO */
+
+	default:
+		editorInsertChar(c)
 	}
+	E.quit_times = kilo_quit_times
 	return true
 }
 
@@ -479,8 +653,10 @@ func initEditor() {
 	E.coloff = 0
 	E.numrows = 0
 	E.row = nil
+	E.dirty = 0
 	E.filename = ""
 	E.statusmsg = ""
+	E.quit_times = kilo_quit_times
 
 	E.screenrows, E.screencols = getWindowSize()
 	E.screenrows -= 2
@@ -494,7 +670,7 @@ func main() {
 		editorOpen(os.Args[1])
 	}
 
-	editorSetStatusMessage("HELP: CTRL-Q = quit")
+	editorSetStatusMessage("HELP: Ctrl-s = save | Ctrl-q = quit")
 
 	for {
 		editorRefreshScreen()
