@@ -43,21 +43,22 @@ type erow struct {
 }
 
 type editorConfig struct {
-	cx, cy         int         //cursor x and y pos relative to the rows and cols
-	rx             int         //index to the render field (cx + amount of tabs * tab spaces)
-	rowoff         int         //row the user scrolled to (vertical scroll offset)
-	coloff         int         //col the user scrolled to (horizontal scroll offset)
-	screenrows     int         //number of rows the terminal can display
-	screencols     int         //number of cols the terminal can display
-	numrows        int         //number of rows in the file
-	row            []erow      //file rows
-	dirty          int         //keeps track of amount of changes made
-	filename       string      //name of the opened file
-	statusmsg      string      //statusmessage for search and other input from the user
-	statusmsg_time time.Time   //timestamp of the message
-	termios        *term.State //original terminal state, restored on exit
-
-	quit_times int // keeping track of ctrl-q presses
+	cx, cy          int         //cursor x and y pos relative to the rows and cols
+	rx              int         //index to the render field (cx + amount of tabs * tab spaces)
+	rowoff          int         //row the user scrolled to (vertical scroll offset)
+	coloff          int         //col the user scrolled to (horizontal scroll offset)
+	screenrows      int         //number of rows the terminal can display
+	screencols      int         //number of cols the terminal can display
+	numrows         int         //number of rows in the file
+	row             []erow      //file rows
+	dirty           int         //keeps track of amount of changes made
+	filename        string      //name of the opened file
+	statusmsg       string      //statusmessage for search and other input from the user
+	statusmsg_time  time.Time   //timestamp of the message
+	termios         *term.State //original terminal state, restored on exit
+	quit_times      int         // keeping track of ctrl-q presses
+	last_match      int         // last search match
+	match_direction int         // direction in which to search the next match
 }
 
 var E editorConfig
@@ -198,6 +199,21 @@ func editorRowCxToRx(row *erow, cx int) int {
 	return rx
 }
 
+func editorRowRxToCx(row *erow, rx int) int {
+	cur_rx := 0
+	cx := 0
+	for cx = range len(row.chars) {
+		if row.chars[cx] == '\t' {
+			cur_rx += (kilo_tab_stop - 1) - (cur_rx % kilo_tab_stop)
+		}
+		cur_rx++
+		if cur_rx > rx {
+			return cx
+		}
+	}
+	return cx
+}
+
 func editorUpdateRow(row *erow) {
 	idx := 0
 	row.render = nil
@@ -282,7 +298,7 @@ func editorInsertNewline() {
 	if E.cx == 0 {
 		editorInsertRow(E.cy, []byte(""))
 	} else {
-		editorInsertRow(E.cy+1, E.row[E.cy].chars[E.cx:])
+		editorInsertRow(E.cy+1, append([]byte{}, E.row[E.cy].chars[E.cx:]...))
 		E.row[E.cy].chars = E.row[E.cy].chars[:E.cx]
 		editorUpdateRow(&E.row[E.cy])
 	}
@@ -346,15 +362,11 @@ func editorOpen(filename string) {
 
 func editorSave() {
 	if E.filename == "" {
-		E.filename = string(editorPrompt("Save as : %s (ESC to cnacel)"))
+		E.filename = string(editorPrompt("Save as: %s (ESC to cancel)", nil))
 		if E.filename == "" {
 			editorSetStatusMessage("Save aborted")
 			return
 		}
-	}
-
-	if E.filename == "" {
-		return
 	}
 
 	buf := editorRowsToString()
@@ -365,6 +377,64 @@ func editorSave() {
 	}
 	editorSetStatusMessage("%d bytes written to disk", len(buf))
 	E.dirty = 0
+}
+
+/* find */
+
+func editorFindCallBack(query []byte, key int) {
+
+	if key == '\r' || key == '\x1b' {
+		E.last_match = -1
+		E.match_direction = 1
+		return
+	} else if key == ARROW_RIGHT || key == ARROW_DOWN {
+		E.match_direction = 1
+	} else if key == ARROW_LEFT || key == ARROW_UP {
+		E.match_direction = -1
+	} else {
+		E.last_match = -1
+		E.match_direction = 1
+	}
+
+	if E.last_match == -1 {
+		E.match_direction = 1
+	}
+	current := E.last_match
+
+	for range E.numrows {
+		current += E.match_direction
+		if current == -1 {
+			current = E.numrows - 1
+		} else if current == E.numrows {
+			current = 0
+		}
+
+		row := &E.row[current]
+		match := bytes.Index(row.render, query)
+		if match != -1 {
+			E.last_match = current
+			E.cy = current
+			E.cx = editorRowRxToCx(row, match)
+			E.rowoff = E.numrows
+			break
+		}
+	}
+}
+
+func editorFind() {
+	saved_cx := E.cx
+	saved_cy := E.cy
+	saved_coloff := E.coloff
+	saved_rowoff := E.rowoff
+
+	query := editorPrompt("Search: %s (Use ESC/Arrows/Enter)", editorFindCallBack)
+
+	if query == nil {
+		E.cx = saved_cx
+		E.cy = saved_cy
+		E.coloff = saved_coloff
+		E.rowoff = saved_rowoff
+	}
 }
 
 /* output */
@@ -514,7 +584,7 @@ func editorSetStatusMessage(format string, args ...any) {
 
 /* input */
 
-func editorPrompt(prompt string) []byte {
+func editorPrompt(prompt string, callback func([]byte, int)) []byte {
 
 	buf := make([]byte, 0)
 	for {
@@ -529,14 +599,23 @@ func editorPrompt(prompt string) []byte {
 
 		} else if c == '\x1b' {
 			editorSetStatusMessage("")
+			if callback != nil {
+				callback(buf, c)
+			}
 			return nil
 		} else if c == '\r' {
 			if len(buf) != 0 {
 				editorSetStatusMessage("")
+				if callback != nil {
+					callback(buf, c)
+				}
 				return buf
 			}
 		} else if c >= 32 && c < 127 {
 			buf = append(buf, byte(c))
+		}
+		if callback != nil {
+			callback(buf, c)
 		}
 
 	}
@@ -609,6 +688,9 @@ func editorProcessKeypress() bool {
 			E.cx = len(E.row[E.cy].chars)
 		}
 
+	case ctrlKey('f'):
+		editorFind()
+
 	case BACKSPACE, ctrlKey('h'):
 		editorDelChar()
 	case DEL_KEY:
@@ -660,6 +742,9 @@ func initEditor() {
 
 	E.screenrows, E.screencols = getWindowSize()
 	E.screenrows -= 2
+
+	E.last_match = -1
+	E.match_direction = 1
 }
 
 func main() {
@@ -670,7 +755,7 @@ func main() {
 		editorOpen(os.Args[1])
 	}
 
-	editorSetStatusMessage("HELP: Ctrl-s = save | Ctrl-q = quit")
+	editorSetStatusMessage("HELP: Ctrl-s = save | Ctrl-q = quit | Ctrl-f = find")
 
 	for {
 		editorRefreshScreen()
